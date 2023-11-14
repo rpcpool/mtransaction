@@ -8,8 +8,16 @@ use solana_client::{
     nonblocking::tpu_connection::TpuConnection,
 };
 use solana_sdk::{signature::Keypair, transport::TransportError};
-use std::{net::IpAddr, sync::Arc};
-use tokio::sync::Semaphore;
+use std::{
+    net::IpAddr,
+    sync::{atomic::Ordering, Arc},
+};
+use tokio::{
+    sync::Semaphore,
+    time::{timeout, Duration},
+};
+
+const SEND_TRANSACTION_TIMEOUT_MS: u64 = 10000;
 
 pub struct QuicForwarder {
     max_permits: usize,
@@ -59,12 +67,22 @@ impl QuicForwarder {
         });
     }
 
-    fn handle_send_result(result: Result<(), TransportError>) {
-        if let Err(err) = result {
-            error!("Failed to send the transaction: {}", err);
-            metrics::TX_FORWARD_FAILED_COUNT.inc();
-        } else {
-            metrics::TX_FORWARD_SUCCEEDED_COUNT.inc();
+    fn handle_send_result(
+        result: Result<Result<(), TransportError>, tokio::time::error::Elapsed>,
+        metrics: Arc<Metrics>,
+    ) {
+        match result {
+            Ok(result) => {
+                if let Err(err) = result {
+                    error!("Failed to send the transaction: {}", err);
+                    metrics.tx_forward_failed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.tx_forward_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(err) => {
+                error!("Timed out sending transaction {:?}", err);
+            }
         }
     }
 }
