@@ -1,4 +1,4 @@
-use crate::auth::{authenticate, load_public_key, Auth};
+use crate::auth::{authenticate, load_public_key, Auth, JWT};
 use crate::solana_service::SignatureWrapper;
 use crate::{balancer::*, metrics};
 use bincode::config::Options;
@@ -171,7 +171,11 @@ pub fn spawn_rpc_server(
     ServerBuilder::with_meta_extractor(
         get_io_handler(),
         move |req: &hyper::Request<hyper::Body>| {
-            let auth = Auth::JWT("internal");
+            let auth = Ok(Auth::JWT(JWT{
+              iat: 0,
+              exp: 0,
+              pubkey: None,
+              partner: Some(String::from("internal"))}));
             
             RpcMetadata {
                 auth: auth.clone(),
