@@ -91,7 +91,9 @@ fn collect_metrics() -> String {
     String::from_utf8(buffer.clone()).unwrap()
 }
 
-pub fn spawn_metrics(metrics_addr: std::net::SocketAddr) -> tokio::task::JoinHandle<()> {
+pub fn spawn_metrics(
+    metrics_addr: std::net::SocketAddr,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let route_metrics = warp::path!("metrics")
             .and(warp::path::end())
