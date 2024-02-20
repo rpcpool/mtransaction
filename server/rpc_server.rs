@@ -202,32 +202,31 @@ pub fn spawn_rpc_server(
                     .map(|header_value| header_value.to_str().unwrap().to_string());
 
 
-            if let Some(public_key) = public_key.clone() {
+            let (auth, mode) = if let Some(public_key) = public_key.clone() {
                 let auth =
                     authenticate((*public_key).clone(), auth_header).map_err(|err| err.to_string());
-                RpcMetadata {
-                    auth: auth.clone(),
-                    balancer: balancer.clone(),
-                    tx_signatures: tx_signatures.clone(),
-                    mode: select_mode(auth.clone().ok(), partners.clone()),
-                }
+
+                (
+                    auth.clone(),
+                    select_mode(auth.clone().ok(), partners.clone()),
+                )
             } else {
                 // In this mode, we trust whatever the end user puts in the Authorization header
                 // This assumes that the end user is well known
                 let from = if let Some(auth_header) = auth_header {
                     auth_header
                 } else {
-                    String::from("internal")
+                    String::from("unknown")
                 };
 
-                let auth = Ok(Auth::Allow(from));
+                (Ok(Auth::Allow(from)), Mode::FORWARD)
+            };
 
-                RpcMetadata {
-                    auth: auth.clone(),
-                    balancer: balancer.clone(),
-                    tx_signatures: tx_signatures.clone(),
-                    mode: Mode::FORWARD,
-                }
+            RpcMetadata {
+                auth: auth,
+                balancer: balancer.clone(),
+                tx_signatures: tx_signatures.clone(),
+                mode: mode,
             }
         },
     )
