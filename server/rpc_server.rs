@@ -154,14 +154,14 @@ impl Rpc for RpcServer {
         let tx_consumers = metrics::SERVER_TOTAL_CONNECTED_TX_CONSUMERS.get();
 
         if tx_consumers == 0 {
-            return Err(jsonrpc_core::error::Error {
+            Err(jsonrpc_core::error::Error {
                 code: jsonrpc_core::error::ErrorCode::ServerError(503),
                 message: "No connected tx consumers".into(),
                 data: None,
-            });
+            })
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
