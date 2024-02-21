@@ -213,11 +213,7 @@ pub fn spawn_rpc_server(
             } else {
                 // In this mode, we trust whatever the end user puts in the Authorization header
                 // This assumes that the end user is well known
-                let from = if let Some(auth_header) = auth_header {
-                    auth_header
-                } else {
-                    String::from("unknown")
-                };
+                let from = auth_header.unwrap_or_else(|| String::from("unknown"));
 
                 (Ok(Auth::Allow(from)), Mode::FORWARD)
             };
