@@ -223,10 +223,10 @@ pub fn spawn_rpc_server(
             };
 
             RpcMetadata {
-                auth: auth,
+                auth,
                 balancer: balancer.clone(),
                 tx_signatures: tx_signatures.clone(),
-                mode: mode,
+                mode,
             }
         },
     )
