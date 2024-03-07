@@ -7,10 +7,10 @@ pub mod rpc_forwarder;
 use crate::forwarder::spawn_forwarder;
 use crate::grpc_client::spawn_grpc_client;
 use env_logger::Env;
-use futures::TryFutureExt;
 use log::{error, info};
 use solana_sdk::signature::read_keypair_file;
 use structopt::StructOpt;
+use tokio::time::{sleep, Duration};
 use tonic::transport::Uri;
 
 pub const VERSION: &str = "rust-0.0.7-beta";
@@ -77,17 +77,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter_mut()
         .map(|grpc_url| {
             let grpc_parsed_url: Uri = grpc_url.parse().unwrap();
-            tokio::spawn(
-                spawn_grpc_client(
-                    grpc_parsed_url.clone(),
-                    params.tls_grpc_ca_cert.clone(),
-                    params.tls_grpc_client_key.clone(),
-                    params.tls_grpc_client_cert.clone(),
-                    tx_transactions.clone(),
-                    metrics::spawn_feeder(grpc_parsed_url.host().unwrap_or("unknown").to_string()),
-                )
-                .map_err(|err| error!("gRPC client failed: {}", err)),
-            )
+            let mut feeder =
+                metrics::spawn_feeder(grpc_parsed_url.host().unwrap_or("unknown").to_string());
+
+            let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
+            let tls_grpc_client_key = params.tls_grpc_client_key.clone();
+            let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
+            let tx_transactions = tx_transactions.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    if let Err(error) = spawn_grpc_client(
+                        grpc_parsed_url.clone(),
+                        tls_grpc_ca_cert.clone(),
+                        tls_grpc_client_key.clone(),
+                        tls_grpc_client_cert.clone(),
+                        tx_transactions.clone(),
+                        &mut feeder,
+                    )
+                    .await
+                    {
+                        error!("gRPC client failed: {error}");
+                    }
+                    sleep(Duration::from_millis(1_000)).await;
+                }
+            })
         })
         .collect();
 
