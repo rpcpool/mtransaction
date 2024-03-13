@@ -88,7 +88,6 @@ async fn mtx_stream(
                 } else {
                     error!("Stream of metrics dropped: {:?}", source);
                     break
-                    break
                 }
             }
 
