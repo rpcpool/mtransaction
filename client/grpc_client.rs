@@ -163,22 +163,15 @@ pub async fn spawn_grpc_client(
 
     let mut client = MTransactionClient::new(channel);
 
-    let mx = mtx_stream(
+    mtx_stream(
         grpc_host.unwrap_or("unknown").to_string(),
         &mut client,
         tx_transactions,
         metrics,
     )
-    .await;
-
-    match mx {
-        Ok(_) => {
-            info!("Stream ended successfully");
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
-
-    Ok(())
+    .await
+    .map(|v| {
+      info!("Stream ended from gRPC server ended: {:?}", grpc_host);
+      v
+    })
 }

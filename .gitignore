@@ -8,3 +8,4 @@ certs/*.req
 certs/*.srl
 certs/*.pub
 .env
+.sw?
