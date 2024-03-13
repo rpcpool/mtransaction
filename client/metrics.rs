@@ -75,6 +75,9 @@ pub fn spawn_feeder(source: String) -> tokio::sync::mpsc::Receiver<RequestMessag
                 .await
             {
                 error!("Failed to feed client metrics: {}", err);
+                if metrics_sender.is_closed() {
+                    break;
+                }
             }
             QUIC_FORWARDER_PERMITS_USED_MAX.set(0);
             sleep(Duration::from_secs(METRICS_SYNC_TIME_IN_S)).await;
