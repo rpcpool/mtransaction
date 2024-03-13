@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
             let tx_transactions = tx_transactions.clone();
 
-            tokio::spawn(with_retry(
+            tokio::spawn(spawn_grpc_connection_with_retry(
                 grpc_parsed_url.clone(),
                 tls_grpc_ca_cert.clone(),
                 tls_grpc_client_key.clone(),
@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn with_retry(
+async fn spawn_grpc_connection_with_retry(
     grpc_parsed_url: Uri,
     tls_grpc_ca_cert: Option<String>,
     tls_grpc_client_key: Option<String>,
