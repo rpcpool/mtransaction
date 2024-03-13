@@ -83,10 +83,11 @@ async fn mtx_stream(
                 if let Some(metrics) = metrics {
                     info!("Sending metrics: {:?}", metrics);
                     if let Err(err) = tx_upstream_transactions.send(metrics) {
-                        error!("Failed to enqueue metrics: {}", err);
+                        error!("Failed to enqueue metrics, source: {:?} err {}", source, err);
                     }
                 } else {
-                    error!("Stream of metrics dropped!");
+                    error!("Stream of metrics dropped: {:?}", source);
+                    break
                     break
                 }
             }
@@ -96,8 +97,8 @@ async fn mtx_stream(
                     process_upstream_message(source.clone(), response, tx_upstream_transactions.clone(), tx_transactions.clone());
                 } else {
                     metrics.close();
-                    error!("Upstream closed!");
-                    return Err("Upstream closed!".into());
+                    error!("Upstream closed: {:?}", source);
+                    return Err("Upstream closed".into());
                 }
             }
         }
