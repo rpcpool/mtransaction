@@ -135,10 +135,7 @@ async fn spawn_grpc_connection_with_retry(
                 retry += 1;
 
                 // Bound the max retry by GRPC_RECONNECT_MAX_DELAY
-                match GRPC_RECONNECT_DELAY*retry {
-                    d if d > GRPC_RECONNECT_MAX_DELAY => GRPC_RECONNECT_MAX_DELAY,
-                    d => d,
-                }
+                GRPC_RECONNECT_MAX_DELAY.min(GRPC_RECONNECT_DELAY * retry)
             }
         };
         info!("retrying {retry} time with a delay of {retry_delay} ms");
