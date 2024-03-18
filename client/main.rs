@@ -4,11 +4,17 @@ pub mod metrics;
 pub mod quic_forwarder;
 pub mod rpc_forwarder;
 
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
 use crate::forwarder::spawn_forwarder;
 use crate::grpc_client::spawn_grpc_client;
 use env_logger::Env;
 use forwarder::ForwardedTransaction;
 use log::{error, info};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use solana_sdk::signature::read_keypair_file;
 use structopt::StructOpt;
 use tokio::{
@@ -16,13 +22,11 @@ use tokio::{
     time::{sleep, Duration},
 };
 use tonic::transport::Uri;
-
 pub const VERSION: &str = "rust-0.0.7-beta";
 
 // Linearly delay retries up to 60 seconds
 const GRPC_RECONNECT_DELAY: u64 = 1_000;
 const GRPC_RECONNECT_MAX_DELAY: u64 = 60_000;
-
 
 #[derive(Debug, StructOpt)]
 struct Params {
@@ -60,6 +64,92 @@ struct Params {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    let grpc_urls_from_file: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cloned_urls = Arc::clone(&grpc_urls_from_file);
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: NotifyResult<Event>| match res {
+            Ok(event) => {
+                // Modify event is triggered twice. Reason unknown
+                info!("event: {:?}", event.kind);
+
+                if event.kind.is_create() || event.kind.is_modify() {
+                    match event.paths.get(0) {
+                        Some(path) => {
+                            if let Ok(file) = std::fs::File::open(path) {
+                                let reader = std::io::BufReader::new(file);
+
+                                let content: Result<serde_yaml::Value, serde_yaml::Error> =
+                                    serde_yaml::from_reader(reader);
+
+                                match content {
+                                    Ok(content) => {
+                                        if let Some(result) =
+                                            content["mtransaction_servers"].as_sequence()
+                                        {
+                                            let new_urls = result
+                                                .iter()
+                                                .map(|x| {
+                                                    if let Some(url) = x.as_str() {
+                                                        return url.to_string();
+                                                    }
+                                                    return "".to_string();
+                                                })
+                                                .collect::<Vec<_>>();
+
+                                            info!("new grpc urls: {:?}", new_urls);
+
+                                            let mut urls = cloned_urls.lock().unwrap();
+                                            urls.extend(new_urls);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("error reading content: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            info!("no path");
+                        }
+                    }
+                }
+            }
+            Err(e) => error!("watch error: {:?}", e),
+        },
+        notify::Config::default(),
+    )?;
+
+    // TODO: Read path from CLI param
+    match watcher.watch(
+        Path::new("/home/almei/Documents/triton/mtransaction/client"),
+        RecursiveMode::Recursive,
+    ) {
+        Ok(_) => {
+            info!("watching file");
+        }
+        Err(e) => {
+            error!("error watching file: {:?}", e);
+        }
+    }
+
+    // Arc unwrapping errors and this isn't being triggered on file updates
+    match Arc::try_unwrap(grpc_urls_from_file) {
+        Ok(grpc_urls_from_file) => match grpc_urls_from_file.into_inner() {
+            Ok(grpc_urls_from_file) => {
+                info!("grpc urls from file: {:?}", grpc_urls_from_file);
+            }
+            Err(_) => {
+                error!("error unwrapping Vec");
+            }
+        },
+        Err(e) => {
+            error!("error unwrapping Arc");
+            error!("{:#?}", e);
+        }
+    }
+
     let params = Params::from_args();
 
     let (identity, tpu_addr) = match (&params.identity, &params.tpu_addr) {
