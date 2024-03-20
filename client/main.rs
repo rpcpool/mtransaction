@@ -4,17 +4,12 @@ pub mod metrics;
 pub mod quic_forwarder;
 pub mod rpc_forwarder;
 
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
-
 use crate::forwarder::spawn_forwarder;
 use crate::grpc_client::spawn_grpc_client;
 use env_logger::Env;
 use forwarder::ForwardedTransaction;
 use log::{error, info};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use signal_hook_tokio::Signals;
 use solana_sdk::signature::read_keypair_file;
 use structopt::StructOpt;
 use tokio::{
@@ -22,6 +17,13 @@ use tokio::{
     time::{sleep, Duration},
 };
 use tonic::transport::Uri;
+
+use signal_hook::consts::SIGHUP;
+
+use std::io::Error;
+
+use futures::stream::StreamExt;
+
 pub const VERSION: &str = "rust-0.0.7-beta";
 
 // Linearly delay retries up to 60 seconds
@@ -41,6 +43,9 @@ struct Params {
 
     #[structopt(long = "grpc-url", default_value = "http://127.0.0.1:50051")]
     grpc_urls: Vec<String>,
+
+    #[structopt(long = "grpc-urls-file")]
+    grpc_urls_file: String,
 
     #[structopt(long = "identity")]
     identity: Option<String>,
@@ -65,92 +70,13 @@ struct Params {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    let grpc_urls_from_file: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let cloned_urls = Arc::clone(&grpc_urls_from_file);
-
-    let mut watcher = RecommendedWatcher::new(
-        move |res: NotifyResult<Event>| match res {
-            Ok(event) => {
-                // Modify event is triggered twice. Reason unknown
-                info!("event: {:?}", event.kind);
-
-                if event.kind.is_create() || event.kind.is_modify() {
-                    match event.paths.get(0) {
-                        Some(path) => {
-                            if let Ok(file) = std::fs::File::open(path) {
-                                let reader = std::io::BufReader::new(file);
-
-                                let content: Result<serde_yaml::Value, serde_yaml::Error> =
-                                    serde_yaml::from_reader(reader);
-
-                                match content {
-                                    Ok(content) => {
-                                        if let Some(result) =
-                                            content["mtransaction_servers"].as_sequence()
-                                        {
-                                            let new_urls = result
-                                                .iter()
-                                                .map(|x| {
-                                                    if let Some(url) = x.as_str() {
-                                                        return url.to_string();
-                                                    }
-                                                    return "".to_string();
-                                                })
-                                                .collect::<Vec<_>>();
-
-                                            info!("new grpc urls: {:?}", new_urls);
-
-                                            let mut urls = cloned_urls.lock().unwrap();
-                                            urls.extend(new_urls);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("error reading content: {:?}", e);
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            info!("no path");
-                        }
-                    }
-                }
-            }
-            Err(e) => error!("watch error: {:?}", e),
-        },
-        notify::Config::default(),
-    )?;
-
-    // TODO: Read path from CLI param
-    match watcher.watch(
-        Path::new("/home/almei/Documents/triton/mtransaction/client"),
-        RecursiveMode::Recursive,
-    ) {
-        Ok(_) => {
-            info!("watching file");
-        }
-        Err(e) => {
-            error!("error watching file: {:?}", e);
-        }
-    }
-
-    // Arc unwrapping errors and this isn't being triggered on file updates
-    match Arc::try_unwrap(grpc_urls_from_file) {
-        Ok(grpc_urls_from_file) => match grpc_urls_from_file.into_inner() {
-            Ok(grpc_urls_from_file) => {
-                info!("grpc urls from file: {:?}", grpc_urls_from_file);
-            }
-            Err(_) => {
-                error!("error unwrapping Vec");
-            }
-        },
-        Err(e) => {
-            error!("error unwrapping Arc");
-            error!("{:#?}", e);
-        }
-    }
-
     let params = Params::from_args();
+
+    let grpc_urls_from_file = read_grpc_urls_from_file(params.grpc_urls_file).unwrap();
+
+    let signals = Signals::new(&[SIGHUP])?;
+
+    let _ = tokio::spawn(handle_signals(signals, grpc_urls_from_file.clone()));
 
     let (identity, tpu_addr) = match (&params.identity, &params.tpu_addr) {
         (Some(identity), Some(tpu_addr)) => (
@@ -170,8 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params.throttle_parallel,
     );
 
-    let tasks: Vec<_> = params
-        .grpc_urls
+    let tasks: Vec<_> = grpc_urls_from_file
         .clone()
         .iter_mut()
         .map(|grpc_url| {
@@ -231,4 +156,106 @@ async fn spawn_grpc_connection_with_retry(
         info!("retrying {retry} time with a delay of {retry_delay} ms");
         sleep(Duration::from_millis(retry_delay)).await;
     }
+}
+
+async fn handle_signals(mut signals: Signals, grpc_urls: Vec<String>) {
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGHUP => {
+                info!("Received SIGHUP signal");
+                let params = Params::from_args();
+                if let Ok(new_grpc_urls) = read_grpc_urls_from_file(params.grpc_urls_file) {
+                    let filtered_grpc_urls = new_grpc_urls
+                        .iter()
+                        .filter(|x| !grpc_urls.contains(x))
+                        .collect::<Vec<_>>();
+
+                    info!("Spawning connection for new urls: {:?}", filtered_grpc_urls);
+
+                    let (identity, tpu_addr) = match (&params.identity, &params.tpu_addr) {
+                        (Some(identity), Some(tpu_addr)) => (
+                            Some(read_keypair_file(identity).unwrap()),
+                            Some(tpu_addr.parse().unwrap()),
+                        ),
+                        _ => (None, None),
+                    };
+
+                    let _metrics = metrics::spawn_metrics(params.metrics_addr.parse().unwrap());
+
+                    let tx_transactions = spawn_forwarder(
+                        identity,
+                        tpu_addr,
+                        params.rpc_url,
+                        params.blackhole,
+                        params.throttle_parallel,
+                    );
+
+                    let tasks: Vec<_> = filtered_grpc_urls
+                        .clone()
+                        .iter_mut()
+                        .map(|grpc_url| {
+                            let grpc_parsed_url: Uri = grpc_url.parse().unwrap();
+
+                            let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
+                            let tls_grpc_client_key = params.tls_grpc_client_key.clone();
+                            let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
+                            let tx_transactions = tx_transactions.clone();
+
+                            tokio::spawn(spawn_grpc_connection_with_retry(
+                                grpc_parsed_url.clone(),
+                                tls_grpc_ca_cert.clone(),
+                                tls_grpc_client_key.clone(),
+                                tls_grpc_client_cert.clone(),
+                                tx_transactions.clone(),
+                            ))
+                        })
+                        .collect();
+
+                    tokio::spawn(async move {
+                        futures::future::join_all(tasks).await;
+                    });
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn read_grpc_urls_from_file(file_path: String) -> Result<Vec<String>, Error> {
+    if let Ok(file) = std::fs::File::open(file_path) {
+        let reader = std::io::BufReader::new(file);
+
+        let content: Result<serde_yaml::Value, serde_yaml::Error> = serde_yaml::from_reader(reader);
+
+        match content {
+            Ok(content) => {
+                if let Some(result) = content["mtransaction_servers"].as_sequence() {
+                    let new_urls = result
+                        .iter()
+                        .map(|x| {
+                            if let Some(url) = x.as_str() {
+                                return url.to_string();
+                            }
+                            return "".to_string();
+                        })
+                        .collect::<Vec<_>>();
+
+                    return Ok(new_urls);
+                } else {
+                    return Err(Error::new(
+                        std::io::ErrorKind::Other,
+                        "No mtransaction_servers found",
+                    ));
+                }
+            }
+            Err(e) => {
+                error!("error reading content: {:?}", e);
+                return Err(Error::new(std::io::ErrorKind::Other, e));
+            }
+        }
+    }
+    return Err(Error::new(
+        std::io::ErrorKind::Other,
+        "No mtransaction_servers found",
+    ));
 }
