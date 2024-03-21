@@ -6,7 +6,7 @@ pub mod rpc_forwarder;
 
 use crate::forwarder::spawn_forwarder;
 use crate::grpc_client::spawn_grpc_client;
-use env_logger::Env;
+use env_logger::{filter, Env};
 use forwarder::ForwardedTransaction;
 use log::{error, info};
 use signal_hook_tokio::Signals;
@@ -72,11 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let params = Params::from_args();
 
+    let (grpc_urls_channel_sender, mut grpc_urls_channel_receiver) =
+        tokio::sync::mpsc::channel::<Vec<String>>(1);
+
     let grpc_urls_from_file = read_grpc_urls_from_file(params.grpc_urls_file).unwrap();
 
     let signals = Signals::new(&[SIGHUP])?;
 
-    let _ = tokio::spawn(handle_signals(signals, grpc_urls_from_file.clone()));
+    let _ = tokio::spawn(handle_signals(signals, grpc_urls_channel_sender));
 
     let (identity, tpu_addr) = match (&params.identity, &params.tpu_addr) {
         (Some(identity), Some(tpu_addr)) => (
@@ -96,28 +99,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params.throttle_parallel,
     );
 
-    let tasks: Vec<_> = grpc_urls_from_file
-        .clone()
-        .iter_mut()
-        .map(|grpc_url| {
-            let grpc_parsed_url: Uri = grpc_url.parse().unwrap();
+    let tasks = build_tasks(
+        grpc_urls_from_file.clone(),
+        &Params::from_args(),
+        tx_transactions.clone(),
+    );
 
-            let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
-            let tls_grpc_client_key = params.tls_grpc_client_key.clone();
-            let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
-            let tx_transactions = tx_transactions.clone();
+    tokio::spawn(async move {
+        futures::future::join_all(tasks).await;
+    });
 
-            tokio::spawn(spawn_grpc_connection_with_retry(
-                grpc_parsed_url.clone(),
-                tls_grpc_ca_cert.clone(),
-                tls_grpc_client_key.clone(),
-                tls_grpc_client_cert.clone(),
-                tx_transactions.clone(),
-            ))
-        })
-        .collect();
+    loop {
+        match grpc_urls_channel_receiver.recv().await {
+            Some(new_grpc_urls) => {
+                let filtered_urls: Vec<String> = new_grpc_urls
+                    .iter()
+                    .filter(|x| !grpc_urls_from_file.contains(x))
+                    .map(|x| x.to_string())
+                    .collect();
 
-    futures::future::join_all(tasks).await;
+                if filtered_urls.len() == 0 {
+                    info!("No new urls to process");
+                    continue;
+                }
+
+                info!("Spawning tasks for new urls: {:?}", filtered_urls);
+
+                let tasks =
+                    build_tasks(filtered_urls, &Params::from_args(), tx_transactions.clone());
+
+                tokio::spawn(async move {
+                    futures::future::join_all(tasks).await;
+                });
+            }
+            None => {
+                info!("No more urls to process");
+                break;
+            }
+        }
+    }
 
     info!("Service stopped.");
     Ok(())
@@ -158,62 +178,23 @@ async fn spawn_grpc_connection_with_retry(
     }
 }
 
-async fn handle_signals(mut signals: Signals, grpc_urls: Vec<String>) {
+async fn handle_signals(mut signals: Signals, sender: tokio::sync::mpsc::Sender<Vec<String>>) {
     while let Some(signal) = signals.next().await {
         match signal {
             SIGHUP => {
                 info!("Received SIGHUP signal");
                 let params = Params::from_args();
                 if let Ok(new_grpc_urls) = read_grpc_urls_from_file(params.grpc_urls_file) {
-                    let filtered_grpc_urls = new_grpc_urls
-                        .iter()
-                        .filter(|x| !grpc_urls.contains(x))
-                        .collect::<Vec<_>>();
+                    info!("Found urls: {:?}", new_grpc_urls);
 
-                    info!("Spawning connection for new urls: {:?}", filtered_grpc_urls);
-
-                    let (identity, tpu_addr) = match (&params.identity, &params.tpu_addr) {
-                        (Some(identity), Some(tpu_addr)) => (
-                            Some(read_keypair_file(identity).unwrap()),
-                            Some(tpu_addr.parse().unwrap()),
-                        ),
-                        _ => (None, None),
-                    };
-
-                    let _metrics = metrics::spawn_metrics(params.metrics_addr.parse().unwrap());
-
-                    let tx_transactions = spawn_forwarder(
-                        identity,
-                        tpu_addr,
-                        params.rpc_url,
-                        params.blackhole,
-                        params.throttle_parallel,
-                    );
-
-                    let tasks: Vec<_> = filtered_grpc_urls
-                        .clone()
-                        .iter_mut()
-                        .map(|grpc_url| {
-                            let grpc_parsed_url: Uri = grpc_url.parse().unwrap();
-
-                            let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
-                            let tls_grpc_client_key = params.tls_grpc_client_key.clone();
-                            let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
-                            let tx_transactions = tx_transactions.clone();
-
-                            tokio::spawn(spawn_grpc_connection_with_retry(
-                                grpc_parsed_url.clone(),
-                                tls_grpc_ca_cert.clone(),
-                                tls_grpc_client_key.clone(),
-                                tls_grpc_client_cert.clone(),
-                                tx_transactions.clone(),
-                            ))
-                        })
-                        .collect();
-
-                    tokio::spawn(async move {
-                        futures::future::join_all(tasks).await;
-                    });
+                    match sender.send(new_grpc_urls).await {
+                        Ok(_) => {
+                            info!("Sent urls to main thread");
+                        }
+                        Err(e) => {
+                            error!("Error sending new urls to main thread: {:?}", e);
+                        }
+                    }
                 }
             }
             _ => unreachable!(),
@@ -258,4 +239,33 @@ fn read_grpc_urls_from_file(file_path: String) -> Result<Vec<String>, Error> {
         std::io::ErrorKind::Other,
         "No mtransaction_servers found",
     ));
+}
+
+fn build_tasks(
+    grpc_urls: Vec<String>,
+    params: &Params,
+    tx_transactions: UnboundedSender<ForwardedTransaction>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let tasks: Vec<_> = grpc_urls
+        .clone()
+        .iter_mut()
+        .map(|grpc_url| {
+            let grpc_parsed_url: Uri = grpc_url.parse().unwrap();
+
+            let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
+            let tls_grpc_client_key = params.tls_grpc_client_key.clone();
+            let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
+            let tx_transactions = tx_transactions.clone();
+
+            tokio::spawn(spawn_grpc_connection_with_retry(
+                grpc_parsed_url.clone(),
+                tls_grpc_ca_cert.clone(),
+                tls_grpc_client_key.clone(),
+                tls_grpc_client_cert.clone(),
+                tx_transactions.clone(),
+            ))
+        })
+        .collect();
+
+    tasks
 }
