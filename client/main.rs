@@ -1,7 +1,6 @@
 pub mod forwarder;
 pub mod grpc_client;
 pub mod metrics;
-pub mod quic_forwarder;
 pub mod rpc_forwarder;
 
 use crate::forwarder::spawn_forwarder;
