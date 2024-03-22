@@ -21,7 +21,7 @@ use tonic::transport::Uri;
 
 use signal_hook::consts::SIGHUP;
 
-use std::{collections::HashMap, io::Error, sync::Arc};
+use std::{collections::HashMap, io::Error};
 
 use futures::stream::StreamExt;
 
@@ -41,9 +41,6 @@ struct Params {
 
     #[structopt(long = "tls-grpc-client-cert")]
     tls_grpc_client_cert: Option<String>,
-
-    #[structopt(long = "grpc-url", default_value = "http://127.0.0.1:50051")]
-    grpc_urls: Vec<String>,
 
     #[structopt(long = "grpc-urls-file")]
     grpc_urls_file: String,
@@ -76,7 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (grpc_urls_channel_sender, mut grpc_urls_channel_receiver) =
         tokio::sync::mpsc::channel::<Vec<String>>(1);
 
-    let mut grpc_urls_from_file = read_grpc_urls_from_file(params.grpc_urls_file).unwrap();
+    let mut grpc_urls_from_file = read_grpc_urls_from_file(params.grpc_urls_file)
+        .expect("failed to read gRPC urls from file");
 
     let signals = Signals::new(&[SIGHUP])?;
 
@@ -100,14 +98,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params.throttle_parallel,
     );
 
-    let all_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let all_tasks: RwLock<HashMap<String, JoinHandle<()>>> =
+       RwLock::new(HashMap::new());
 
     build_tasks(
         grpc_urls_from_file.clone(),
         &Params::from_args(),
         tx_transactions.clone(),
-        Arc::clone(&all_tasks),
+        &all_tasks,
     )
     .await;
 
@@ -120,24 +118,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|x| x.to_string())
                     .collect();
 
-                let urls_to_abort: Vec<String> = grpc_urls_from_file
+                let mut locked_all_tasks = all_tasks.write().await;
+                for grpc in grpc_urls_from_file
                     .iter()
                     .filter(|x| !new_grpc_urls.contains(x))
-                    .map(|x| x.to_string())
-                    .collect();
-
-                for i in urls_to_abort {
-                    let mut all_tasks = all_tasks.write().await;
-                    if let Some(task) = all_tasks.remove(&i) {
-                        info!("Aborting task for url: {:?}", i);
+                {
+                    if let Some(task) = locked_all_tasks.remove(grpc) {
+                        info!("Aborting task for url: {grpc:?}");
                         task.abort();
                     }
                 }
+                drop(locked_all_tasks);
 
                 grpc_urls_from_file.clear();
                 grpc_urls_from_file.extend(new_grpc_urls.clone());
 
-                if urls_to_spawn.len() == 0 {
+                if urls_to_spawn.is_empty() {
                     info!("No new urls to spawn for");
                     continue;
                 }
@@ -148,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     urls_to_spawn,
                     &Params::from_args(),
                     tx_transactions.clone(),
-                    Arc::clone(&all_tasks),
+                    &all_tasks,
                 )
                 .await;
             }
@@ -271,12 +267,12 @@ async fn build_tasks(
     grpc_urls: Vec<String>,
     params: &Params,
     tx_transactions: UnboundedSender<ForwardedTransaction>,
-    all_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    all_tasks: &RwLock<HashMap<String, JoinHandle<()>>>,
 ) {
-    for i in grpc_urls.clone() {
-        let mut all_tasks = all_tasks.write().await;
+    let mut all_tasks = all_tasks.write().await;
+    for i in grpc_urls {
 
-        let grpc_parsed_url: Uri = i.parse().unwrap();
+        let grpc_parsed_url: Uri = i.parse().expect("failed to parse grpc url");
 
         let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
         let tls_grpc_client_key = params.tls_grpc_client_key.clone();
