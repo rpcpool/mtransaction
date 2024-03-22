@@ -6,21 +6,22 @@ pub mod rpc_forwarder;
 
 use crate::forwarder::spawn_forwarder;
 use crate::grpc_client::spawn_grpc_client;
-use env_logger::{filter, Env};
+use env_logger::Env;
 use forwarder::ForwardedTransaction;
 use log::{error, info};
 use signal_hook_tokio::Signals;
 use solana_sdk::signature::read_keypair_file;
 use structopt::StructOpt;
 use tokio::{
-    sync::mpsc::UnboundedSender,
+    sync::{mpsc::UnboundedSender, RwLock},
+    task::JoinHandle,
     time::{sleep, Duration},
 };
 use tonic::transport::Uri;
 
 use signal_hook::consts::SIGHUP;
 
-use std::io::Error;
+use std::{collections::HashMap, io::Error, sync::Arc};
 
 use futures::stream::StreamExt;
 
@@ -75,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (grpc_urls_channel_sender, mut grpc_urls_channel_receiver) =
         tokio::sync::mpsc::channel::<Vec<String>>(1);
 
-    let grpc_urls_from_file = read_grpc_urls_from_file(params.grpc_urls_file).unwrap();
+    let mut grpc_urls_from_file = read_grpc_urls_from_file(params.grpc_urls_file).unwrap();
 
     let signals = Signals::new(&[SIGHUP])?;
 
@@ -99,38 +100,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params.throttle_parallel,
     );
 
-    let tasks = build_tasks(
+    let all_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    build_tasks(
         grpc_urls_from_file.clone(),
         &Params::from_args(),
         tx_transactions.clone(),
-    );
-
-    tokio::spawn(async move {
-        futures::future::join_all(tasks).await;
-    });
+        Arc::clone(&all_tasks),
+    )
+    .await;
 
     loop {
         match grpc_urls_channel_receiver.recv().await {
             Some(new_grpc_urls) => {
-                let filtered_urls: Vec<String> = new_grpc_urls
+                let urls_to_spawn: Vec<String> = new_grpc_urls
                     .iter()
                     .filter(|x| !grpc_urls_from_file.contains(x))
                     .map(|x| x.to_string())
                     .collect();
 
-                if filtered_urls.len() == 0 {
-                    info!("No new urls to process");
+                let urls_to_abort: Vec<String> = grpc_urls_from_file
+                    .iter()
+                    .filter(|x| !new_grpc_urls.contains(x))
+                    .map(|x| x.to_string())
+                    .collect();
+
+                for i in urls_to_abort {
+                    let mut all_tasks = all_tasks.write().await;
+                    if let Some(task) = all_tasks.remove(&i) {
+                        info!("Aborting task for url: {:?}", i);
+                        task.abort();
+                    }
+                }
+
+                grpc_urls_from_file.clear();
+                grpc_urls_from_file.extend(new_grpc_urls.clone());
+
+                if urls_to_spawn.len() == 0 {
+                    info!("No new urls to spawn for");
                     continue;
                 }
 
-                info!("Spawning tasks for new urls: {:?}", filtered_urls);
+                info!("Spawning tasks for new urls: {:?}", urls_to_spawn);
 
-                let tasks =
-                    build_tasks(filtered_urls, &Params::from_args(), tx_transactions.clone());
-
-                tokio::spawn(async move {
-                    futures::future::join_all(tasks).await;
-                });
+                build_tasks(
+                    urls_to_spawn,
+                    &Params::from_args(),
+                    tx_transactions.clone(),
+                    Arc::clone(&all_tasks),
+                )
+                .await;
             }
             None => {
                 info!("No more urls to process");
@@ -221,6 +241,12 @@ fn read_grpc_urls_from_file(file_path: String) -> Result<Vec<String>, Error> {
                         })
                         .collect::<Vec<_>>();
 
+                    let new_urls = new_urls
+                        .iter()
+                        .filter(|x| !x.is_empty())
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>();
+
                     return Ok(new_urls);
                 } else {
                     return Err(Error::new(
@@ -241,31 +267,30 @@ fn read_grpc_urls_from_file(file_path: String) -> Result<Vec<String>, Error> {
     ));
 }
 
-fn build_tasks(
+async fn build_tasks(
     grpc_urls: Vec<String>,
     params: &Params,
     tx_transactions: UnboundedSender<ForwardedTransaction>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let tasks: Vec<_> = grpc_urls
-        .clone()
-        .iter_mut()
-        .map(|grpc_url| {
-            let grpc_parsed_url: Uri = grpc_url.parse().unwrap();
+    all_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+) {
+    for i in grpc_urls.clone() {
+        let mut all_tasks = all_tasks.write().await;
 
-            let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
-            let tls_grpc_client_key = params.tls_grpc_client_key.clone();
-            let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
-            let tx_transactions = tx_transactions.clone();
+        let grpc_parsed_url: Uri = i.parse().unwrap();
 
-            tokio::spawn(spawn_grpc_connection_with_retry(
-                grpc_parsed_url.clone(),
-                tls_grpc_ca_cert.clone(),
-                tls_grpc_client_key.clone(),
-                tls_grpc_client_cert.clone(),
-                tx_transactions.clone(),
-            ))
-        })
-        .collect();
+        let tls_grpc_ca_cert = params.tls_grpc_ca_cert.clone();
+        let tls_grpc_client_key = params.tls_grpc_client_key.clone();
+        let tls_grpc_client_cert = params.tls_grpc_client_cert.clone();
+        let tx_transactions = tx_transactions.clone();
 
-    tasks
+        let tsk = tokio::spawn(spawn_grpc_connection_with_retry(
+            grpc_parsed_url.clone(),
+            tls_grpc_ca_cert.clone(),
+            tls_grpc_client_key.clone(),
+            tls_grpc_client_cert.clone(),
+            tx_transactions.clone(),
+        ));
+
+        all_tasks.insert(i.clone(), tsk);
+    }
 }
