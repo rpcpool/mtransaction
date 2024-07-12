@@ -128,7 +128,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("Test partners loaded: {:?}", &partners);
     }
 
-    let _rpc_server = spawn_rpc_server(
+    let (_rpc_server, _rpc_runtime) = spawn_rpc_server(
         params.rpc_addr.parse().unwrap(),
         params.jwt_public_key,
         params.test_partners,

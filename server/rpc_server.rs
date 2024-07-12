@@ -250,7 +250,7 @@ pub fn spawn_rpc_server(
     test_partners: Option<Vec<String>>,
     balancer: Arc<RwLock<Balancer>>,
     tx_signatures: UnboundedSender<SignatureWrapper>,
-) -> Server {
+) -> (Server, Arc<tokio::runtime::Runtime>) {
     info!("Spawning RPC server.");
 
     let public_key = jwt_public_key_path.map(|jwt_public_key_path| {
@@ -261,14 +261,14 @@ pub fn spawn_rpc_server(
     });
     let partners = test_partners.unwrap_or_default();
 
-    let event_loop = tokio::runtime::Builder::new_multi_thread()
+    let event_loop = Arc::new(tokio::runtime::Builder::new_multi_thread()
         .thread_name("mt-rpc-server")
         .worker_threads(256) // TODO: make this configurable
         .enable_all()
         .build()
-        .unwrap();
+        .unwrap());
 
-    ServerBuilder::with_meta_extractor(
+    let server = ServerBuilder::with_meta_extractor(
         get_io_handler(),
         move |req: &hyper::Request<hyper::Body>| {
             // If we are using authentication, then check the auth header
@@ -310,5 +310,6 @@ pub fn spawn_rpc_server(
     .keep_alive(true)
     .event_loop_executor(event_loop.handle().clone())
     .start_http(&rpc_addr)
-    .expect("Unable to start TCP RPC server")
+    .expect("Unable to start TCP RPC server");
+    (server, event_loop)
 }
